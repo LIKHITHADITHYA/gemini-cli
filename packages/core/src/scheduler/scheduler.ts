@@ -26,6 +26,7 @@ import {
   type ScheduledToolCall,
 } from './types.js';
 import { ToolErrorType } from '../tools/tool-error.js';
+import { UPDATE_TOPIC_TOOL_NAME } from '../tools/tool-names.js';
 import { PolicyDecision, type ApprovalMode } from '../policy/types.js';
 import {
   ToolConfirmationOutcome,
@@ -35,6 +36,7 @@ import { getToolSuggestion } from '../utils/tool-utils.js';
 import { runInDevTraceSpan } from '../telemetry/trace.js';
 import { logToolCall } from '../telemetry/loggers.js';
 import { ToolCallEvent } from '../telemetry/types.js';
+import { populateToolDisplay } from '../agent/tool-display-utils.js';
 import type { EditorType } from '../utils/editor.js';
 import {
   MessageBusType,
@@ -77,7 +79,7 @@ const createErrorResponse = (
     {
       functionResponse: {
         id: request.callId,
-        name: request.name,
+        name: request.originalRequestName ?? request.name,
         response: { error: error.message },
       },
     },
@@ -92,8 +94,7 @@ const createErrorResponse = (
  * Coordinates execution via state updates and event listening.
  */
 export class Scheduler {
-  // Tracks which MessageBus instances have the legacy listener attached to prevent duplicates.
-  private static subscribedMessageBuses = new WeakSet<MessageBus>();
+  private readonly disposeController = new AbortController();
 
   private readonly state: SchedulerStateManager;
   private readonly executor: ToolExecutor;
@@ -135,6 +136,7 @@ export class Scheduler {
 
   dispose(): void {
     coreEvents.off(CoreEvent.McpProgress, this.handleMcpProgress);
+    this.disposeController.abort();
   }
 
   private readonly handleMcpProgress = (payload: McpProgressPayload) => {
@@ -162,26 +164,25 @@ export class Scheduler {
     });
   };
 
-  private setupMessageBusListener(messageBus: MessageBus): void {
-    if (Scheduler.subscribedMessageBuses.has(messageBus)) {
-      return;
-    }
+  private readonly handleToolConfirmationRequest = async (
+    request: ToolConfirmationRequest,
+  ) => {
+    await this.messageBus.publish({
+      type: MessageBusType.TOOL_CONFIRMATION_RESPONSE,
+      correlationId: request.correlationId,
+      confirmed: false,
+      requiresUserConfirmation: true,
+    });
+  };
 
+  private setupMessageBusListener(messageBus: MessageBus): void {
     // TODO: Optimize policy checks. Currently, tools check policy via
     // MessageBus even though the Scheduler already checked it.
     messageBus.subscribe(
       MessageBusType.TOOL_CONFIRMATION_REQUEST,
-      async (request: ToolConfirmationRequest) => {
-        await messageBus.publish({
-          type: MessageBusType.TOOL_CONFIRMATION_RESPONSE,
-          correlationId: request.correlationId,
-          confirmed: false,
-          requiresUserConfirmation: true,
-        });
-      },
+      this.handleToolConfirmationRequest,
+      { signal: this.disposeController.signal },
     );
-
-    Scheduler.subscribedMessageBuses.add(messageBus);
   }
 
   /**
@@ -196,6 +197,8 @@ export class Scheduler {
       {
         operation: GeminiCliOperation.ScheduleToolCalls,
         logPrompts: this.context.config.getTelemetryLogPromptsEnabled(),
+        tracesEnabled: this.context.config.getTelemetryTracesEnabled(),
+        sessionId: this.context.config.getSessionId(),
       },
       async ({ metadata: spanMetadata }) => {
         const requests = Array.isArray(request) ? request : [request];
@@ -302,9 +305,16 @@ export class Scheduler {
     this.state.clearBatch();
     const currentApprovalMode = this.config.getApprovalMode();
 
+    // Sort requests to ensure Topic changes happen before actions in the same batch.
+    const sortedRequests = [...requests].sort((a, b) => {
+      if (a.name === UPDATE_TOPIC_TOOL_NAME) return -1;
+      if (b.name === UPDATE_TOPIC_TOOL_NAME) return 1;
+      return 0;
+    });
+
     try {
       const toolRegistry = this.context.toolRegistry;
-      const newCalls: ToolCall[] = requests.map((request) => {
+      const newCalls: ToolCall[] = sortedRequests.map((request) => {
         const enrichedRequest: ToolCallRequestInfo = {
           ...request,
           schedulerId: this.schedulerId,
@@ -372,6 +382,16 @@ export class Scheduler {
       () => {
         try {
           const invocation = tool.build(request.args);
+          if (!request.display) {
+            request.display = populateToolDisplay({
+              name: tool.name,
+              invocation,
+              displayName: tool.displayName,
+            });
+            if (!request.display.description) {
+              request.display.description = tool.description;
+            }
+          }
           return {
             status: CoreToolCallStatus.Validating,
             request,
@@ -527,6 +547,10 @@ export class Scheduler {
   }
 
   private _isParallelizable(request: ToolCallRequestInfo): boolean {
+    // update_topic tool is forced as sequential call
+    if (request.name === UPDATE_TOPIC_TOOL_NAME) {
+      return false;
+    }
     if (request.args) {
       const wait = request.args['wait_for_previous'];
       if (typeof wait === 'boolean') {
@@ -766,6 +790,8 @@ export class Scheduler {
         name: tailRequest.name,
         args: tailRequest.args,
         originalRequestName,
+        originalRequestArgs:
+          result.request.originalRequestArgs ?? result.request.args,
         isClientInitiated: result.request.isClientInitiated,
         prompt_id: result.request.prompt_id,
         schedulerId: this.schedulerId,
@@ -891,7 +917,7 @@ export class Scheduler {
           } as ScheduledToolCall,
           signal,
         );
-      } catch (_e) {
+      } catch {
         // Fallback to normal error handling if parsing/looping fails
       }
     }
